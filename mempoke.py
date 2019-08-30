@@ -48,31 +48,59 @@ def get_memory_data(mem_info):
     return ret
 
 
-def seek_memory(mem_info, mem_data, pattern, replace=None, read=None):
+def read_memory(mem_data, rel_address, nb_bytes=None):
+    if nb_bytes and type(nb_bytes) == int:
+        # if read-bytes flag is used, read that amount of bytes
+        return mem_data[rel_address:rel_address + nb_bytes]
+
+    else:
+        # read until next zero byte or at max 150
+        until_zero = mem_data.find(b'\x00', rel_address)
+        if until_zero - rel_address > 150:
+            until_zero = rel_address + 150
+        return mem_data[rel_address:until_zero]
+
+
+def write_memory(pid, address, data):
+    with open(f"/proc/{pid}/mem", "r+b") as mem_file:
+        mem_file.seek(address)
+        mem_file.write(bytes(data, "ASCII"))
+        mem_file.flush()
+
+
+def seek_memory(mem_info, mem_data, seek=None, write=None, read=None):
     results = []
+
     for inf, mem in zip(mem_info, mem_data):
         last_addr = 0
-        while True:
-            offset = mem.find(pattern.encode(), last_addr)
-            if offset < 0:
-                break
-            found_addr = int(inf["start"], 16) + offset
-            if read and type(read) == int:
-                # if read-bytes flag is used, read that amount of bytes
-                results.append({'read': mem[offset:offset + read], 'addr': hex(found_addr), 'region': inf["region"]})
-            else:
-                # By default, read until next zero byte or at max 150
-                until_zero = mem.find(b'\x00', offset)
-                if until_zero - offset > 150:
-                    until_zero = offset + 150
-                results.append({'read': mem[offset:until_zero], 'addr': hex(found_addr), 'region': inf["region"]})
-            last_addr = offset + 1
 
-            if replace:
-                with open(f"/proc/{inf['pid']}/mem", "r+b") as mem_file:
-                    mem_file.seek(found_addr)
-                    mem_file.write(bytes(replace + '\0', "ASCII"))
-                    mem_file.flush()
+        # if seeking an address (starting with '0x'), just go directly there without looping
+        if seek[:2] == '0x':
+            dec_addr = int(seek, 16)
+            start = int(inf['start'], 16)
+            end = int(inf['end'], 16)
+            if start <= dec_addr and end > dec_addr:
+                read_data = read_memory(mem, dec_addr - start, nb_bytes=read)
+                results.append({'read': read_data, 'at': seek, 'info': inf})
+
+                if write:
+                    write_memory(inf["pid"], dec_addr, write)
+
+                break
+        else:
+            while True:
+                offset = mem.find(seek.encode(), last_addr)
+                if offset < 0:
+                    break
+
+                absolute_addr = int(inf["start"], 16) + offset
+                read_data = read_memory(mem, offset, nb_bytes=read)
+                results.append({'read': read_data, 'at': hex(absolute_addr), 'info': inf})
+
+                if write:
+                    write_memory(inf["pid"], absolute_addr, write)
+
+                last_addr = offset + 1
 
     return results
 
@@ -86,7 +114,7 @@ if __name__ == "__main__":
     parser.add_argument('-d', '--dump', default=False, action="store_true", help='Dump memory into stdout')
 
     # Seek options
-    parser.add_argument('-s', '--seek', help='Pattern to seek in memory')
+    parser.add_argument('-s', '--seek', help='Pattern to seek in memory, or address if prefixed with "0x"')
     parser.add_argument('-w', '--write', nargs='?', help='String to write at position found by the "--seek" argument')
     parser.add_argument('-b', '--read-bytes', nargs='?', type=int, help='Number of bytes to read when seeking a pattern')
 
@@ -104,11 +132,8 @@ if __name__ == "__main__":
     elif args.seek:
         mem_info = get_memory_info(args.pids, args.filter)
         mem_data = get_memory_data(mem_info)
-        if not args.seek:
-            print('argument "-p/--pattern" is required by the "seek" operation!')
-            quit(1)
 
-        results = seek_memory(mem_info, mem_data, args.seek, replace=args.write, read=args.read_bytes)
+        results = seek_memory(mem_info, mem_data, args.seek, write=args.write, read=args.read_bytes)
         if not results:
             print("pattern not found")
             quit(1)
