@@ -64,7 +64,7 @@ def read_memory(mem_data, rel_address, nb_bytes=None):
 def write_memory(pid, address, data):
     with open(f"/proc/{pid}/mem", "r+b") as mem_file:
         mem_file.seek(address)
-        mem_file.write(bytes(data, "ASCII"))
+        mem_file.write(bytes(data.replace("\\x00", "\x00"), "ASCII"))
         mem_file.flush()
 
 
@@ -80,12 +80,13 @@ def seek_memory(mem_info, mem_data, seek=None, write=None, read=None):
             start = int(inf['start'], 16)
             end = int(inf['end'], 16)
             if start <= dec_addr and end > dec_addr:
-                read_data = read_memory(mem, dec_addr - start, nb_bytes=read)
-                results.append({'read': read_data, 'at': seek, 'info': inf})
 
                 if write:
                     write_memory(inf["pid"], dec_addr, write)
-
+                    results.append({'at': seek, 'info': inf})
+                else:
+                    read_data = read_memory(mem, dec_addr - start, nb_bytes=read)
+                    results.append({'read': read_data, 'at': seek, 'info': inf})
                 break
         else:
             while True:
@@ -94,11 +95,12 @@ def seek_memory(mem_info, mem_data, seek=None, write=None, read=None):
                     break
 
                 absolute_addr = int(inf["start"], 16) + offset
-                read_data = read_memory(mem, offset, nb_bytes=read)
-                results.append({'read': read_data, 'at': hex(absolute_addr), 'info': inf})
-
                 if write:
                     write_memory(inf["pid"], absolute_addr, write)
+                    results.append({'at': hex(absolute_addr), 'info': inf})
+                else:
+                    read_data = read_memory(mem, offset, nb_bytes=read)
+                    results.append({'read': read_data, 'at': hex(absolute_addr), 'info': inf})
 
                 last_addr = offset + 1
 
