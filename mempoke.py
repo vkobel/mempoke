@@ -2,11 +2,12 @@
 
 from collections import namedtuple
 from typing import NamedTuple
-from pprint import pformat, pprint
+from pprint import pprint
 import argparse
+import itertools
 import sys
 
-SeekResult = namedtuple('SeekResult', ['data', 'address', 'region'])
+SeekResult = namedtuple('SeekResult', ['data', 'address', 'region', 'perm', 'pid'])
 
 
 class MemoryRegion(NamedTuple):
@@ -30,7 +31,7 @@ class MemoryRegion(NamedTuple):
 
         if nb_bytes and type(nb_bytes) == int:
             # if read-bytes flag is used, read that amount of bytes
-            return mem_data[rel_address:rel_address + nb_bytes]
+            return mem_data[rel_address - nb_bytes:rel_address + nb_bytes]
         else:
             # read until next zero byte or at max 150
             until_zero = mem_data.find(b'\x00', rel_address)
@@ -52,7 +53,7 @@ class ProcessMemory:
                     addrs = list(map(lambda x: int(x, 16), region_info[0].split("-")))
 
                     region = MemoryRegion(
-                        name=region_info[5] if len(region_info) > 5 else addrs[0],
+                        name=region_info[5] if len(region_info) > 5 else hex(addrs[0]),
                         start=addrs[0],
                         end=addrs[1],
                         perm=region_info[1],
@@ -72,10 +73,13 @@ class ProcessMemory:
             raise Exception(f"PID '{self.pid}' not found!")
 
     def __write(self, address, data):
-        with open(f"/proc/{self.pid}/mem", "r+b") as mem_file:
-            mem_file.seek(address)
-            mem_file.write(bytes(data.replace("\\x00", "\x00"), "ASCII"))
-            mem_file.flush()
+        try:
+            with open(f"/proc/{self.pid}/mem", "r+b") as mem_file:
+                mem_file.seek(address)
+                mem_file.write(bytes(data.replace("\\x00", "\x00"), "ASCII"))
+                mem_file.flush()
+        except OSError:
+            pass
 
     def seek_memory(self, seek, write=None, read=None):
         for region in self.regions:
@@ -90,7 +94,7 @@ class ProcessMemory:
                         self.__write(dec_addr, write)
 
                     read_data = region.read_at_address(dec_addr - region.start, nb_bytes=read)
-                    yield SeekResult(read_data, seek, region.name)
+                    yield SeekResult(read_data, seek, region.name, region.perm, self.pid)
                     break
             else:
                 while True:
@@ -105,10 +109,7 @@ class ProcessMemory:
 
                     read_data = region.read_at_address(offset, nb_bytes=read)
                     last_addr = offset + 1
-                    yield SeekResult(read_data, hex(absolute_addr), region.name)
-
-    def __str__(self):
-        return '\n'.join(map(lambda r: pformat(r._asdict()), self.regions))
+                    yield SeekResult(read_data, hex(absolute_addr), region.name, region.perm, self.pid)
 
 
 if __name__ == "__main__":
@@ -137,7 +138,7 @@ if __name__ == "__main__":
             sys.stderr.buffer.write(b"\n\nWarning multiple memory regions have been dump")
 
     elif args.seek:
-        results = list(map(lambda p: list(p.seek_memory(args.seek, write=args.write, read=args.read_bytes)), processes))
+        results = list(itertools.chain.from_iterable(map(lambda p: list(p.seek_memory(args.seek, write=args.write, read=args.read_bytes)), processes)))
         if not results:
             print("pattern not found")
             quit(1)
@@ -145,4 +146,6 @@ if __name__ == "__main__":
             pprint(results)
 
     else:
-        [print(process) for process in processes]
+        all_regions = [region for process in processes for region in process.regions]
+        for reg in all_regions:
+            pprint(reg._asdict())
