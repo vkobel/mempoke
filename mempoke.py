@@ -191,19 +191,14 @@ if __name__ == "__main__":
             sys.stderr.buffer.write(b"\n\nWarning multiple memory regions have been dump")
 
     elif args.seek:
-        results = list(itertools.chain.from_iterable(map(lambda p: list(p.seek_memory(args.seek, write=args.write, read=args.read_bytes)), processes)))
-        if not results:
-            print("term:", args.seek)
-            print(" ", "pattern not found")
-            quit(1)
-        else:
-            for res in results:
-                print("term:", res.term)
-                print(" ", "region name:", res.region.name)
-                print(" ", "pid:", res.region.pid)
-                print(" ", "data:", res.data)
-                print(" ", "found at:", res.address)
-                print()
+        results = itertools.chain.from_iterable(map(lambda p: (p.seek_memory(args.seek, write=args.write, read=args.read_bytes)), processes))
+        for res in results:
+            print("term:", res.term)
+            print(" ", "data:", res.data)
+            print(" ", "found at:", res.address)
+            print(" ", "pid:", res.region.pid)
+            print(" ", "region:", res.region.name)
+            print()
 
     elif args.monitor:
         pass
@@ -211,11 +206,10 @@ if __name__ == "__main__":
     else:
         all_regions = [region for process in processes for region in process.regions]
         for reg in all_regions:
-            print("region:", reg.name)
+            print(f"[{reg.pid}] region:", reg.name)
             print(" ", "address:", hex(reg.start), "--", hex(reg.end))
             print(" ", "size:", reg.size)
             print(" ", "perm:", reg.perm)
-            print(" ", "size:", reg.pid)
             if args.checksum:
                 print(" ", "checksum:", reg.checksum())
             print()
