@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
-
 from collections import namedtuple
-from pprint import pprint
 from hashlib import md5
 import sys
 import argparse
 import itertools
 
 SeekResult = namedtuple('SeekResult', ['term', 'data', 'address', 'region'])
-
-
-def digest(data):
-    h = md5()
-    h.update(data)
-    return h.hexdigest()
 
 
 class MemoryRegion:
@@ -23,7 +15,8 @@ class MemoryRegion:
     perm: str
     size: int
     pid: int
-    checksum: str
+    __checksum: str
+    __mem_cache: bytes
 
     def __init__(self, name, start, end, perm, size, pid):
         self.name = name
@@ -32,31 +25,41 @@ class MemoryRegion:
         self.perm = perm
         self.size = size
         self.pid = pid
+        self.__checksum = None
+        self.__mem_cache = bytes()
 
-    def read(self):
-        with open(f"/proc/{self.pid}/mem", "r+b") as mem_file:
-            mem_file.seek(self.start)
-            try:
-                return mem_file.read(self.size)
-            except OSError:
-                return bytes()
+    def read_region(self, force_refresh=False):
+        if not self.__mem_cache or force_refresh:
+            with open(f"/proc/{self.pid}/mem", "r+b") as mem_file:
+                mem_file.seek(self.start)
+                try:
+                    self.__mem_cache = mem_file.read(self.size)
+                except OSError:
+                    self.__mem_cache = bytes()
 
-    def read_at_address(self, rel_address, nb_bytes=None):
-        mem_data = self.read()
+        return self.__mem_cache
+
+    def checksum(self, force_refresh=False):
+        if not self.__checksum:
+            self.__checksum = digest(self.read_region(force_refresh))
+        return self.__checksum
+
+    def read_at_address(self, rel_address, nb_bytes=None, force_refresh=False):
+        mem_data = self.read_region(force_refresh)
 
         if nb_bytes and type(nb_bytes) == int:
             # if read-bytes flag is used, read that amount of bytes
             return mem_data[rel_address - nb_bytes:rel_address + nb_bytes]
         else:
-            # read until next zero byte or at max 150
+            # read until next zero byte or at max 50
             until_zero = mem_data.find(b'\x00', rel_address)
-            if until_zero - rel_address > 150:
-                until_zero = rel_address + 150
+            if until_zero - rel_address > 50:
+                until_zero = rel_address + 50
             return mem_data[rel_address:until_zero]
 
 
 class ProcessMemory:
-    def __init__(self, pid, incl_filter=None, excl_filter=None, checksum=False):
+    def __init__(self, pid, incl_filter=None, excl_filter=None):
         self.pid = pid
         self.regions = []
 
@@ -81,9 +84,6 @@ class ProcessMemory:
                     if (not incl_filter and not excl_filter) or \
                        (not incl_filter or any(lookup_str.find(f_itm) >= 0 for f_itm in incl_filter)) and \
                        (not excl_filter or all(lookup_str.find(f_itm) < 0 for f_itm in excl_filter)):
-
-                        if checksum:
-                            region.checksum = digest(region.read())
 
                         self.regions.append(region)
                         total_size += region.size
@@ -112,14 +112,16 @@ class ProcessMemory:
                 dec_addr = int(seek, 16)
                 if region.start <= dec_addr and region.end > dec_addr:
 
+                    refresh_cache = False
                     if write:
                         self.__write(dec_addr, write)
+                        refresh_cache = True
 
-                    read_data = region.read_at_address(dec_addr - region.start, nb_bytes=read)
+                    read_data = region.read_at_address(dec_addr - region.start, nb_bytes=read, force_refresh=refresh_cache)
                     yield SeekResult(seek, read_data, seek, region)
                     break
             else:
-                mem = region.read()
+                mem = region.read_region()
                 while True:
                     term = to_bytes(seek)
                     offset = mem.find(term, last_addr)
@@ -127,10 +129,12 @@ class ProcessMemory:
                         break
 
                     absolute_addr = region.start + offset
+                    refresh_cache = False
                     if write:
                         self.__write(absolute_addr, write)
+                        refresh_cache = True
 
-                    read_data = region.read_at_address(offset, nb_bytes=read)
+                    read_data = region.read_at_address(offset, nb_bytes=read, force_refresh=refresh_cache)
                     last_addr = offset + 1
                     yield SeekResult(term, read_data, hex(absolute_addr), region)
 
@@ -141,7 +145,7 @@ def to_bytes(data):
         # bytes repr as of : https://docs.python.org/3/library/stdtypes.html#int.to_bytes
         return integer.to_bytes((integer.bit_length() + 7) // 8, byteorder=sys.byteorder)
     else:
-        return data.encode()
+        return data.replace("\\x00", "\x00").encode()
 
 
 def from_bytes(data):
@@ -149,6 +153,12 @@ def from_bytes(data):
         return int.from_bytes(data, byteorder=sys.byteorder)
     else:
         return data
+
+
+def digest(data):
+    h = md5()
+    h.update(data)
+    return h.hexdigest()
 
 
 if __name__ == "__main__":
@@ -170,12 +180,12 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    processes = map(lambda pid: ProcessMemory(pid, incl_filter=args.include, excl_filter=args.exclude, checksum=args.checksum), args.pids)
+    processes = map(lambda pid: ProcessMemory(pid, incl_filter=args.include, excl_filter=args.exclude), args.pids)
 
     if args.dump:
         all_regions = [region for process in processes for region in process.regions]
         for region in all_regions:
-            sys.stdout.buffer.write(region.read())
+            sys.stdout.buffer.write(region.read_region())
 
         if len(all_regions) > 1:
             sys.stderr.buffer.write(b"\n\nWarning multiple memory regions have been dump")
@@ -183,17 +193,29 @@ if __name__ == "__main__":
     elif args.seek:
         results = list(itertools.chain.from_iterable(map(lambda p: list(p.seek_memory(args.seek, write=args.write, read=args.read_bytes)), processes)))
         if not results:
-            print("pattern not found")
+            print("term:", args.seek)
+            print(" ", "pattern not found")
             quit(1)
         else:
             for res in results:
-                print("Term: ", res.term)
-                print("Data: ", res.data)
-                print("Address: ", res.address)
-                pprint(vars(res.region))
+                print("term:", res.term)
+                print(" ", "region name:", res.region.name)
+                print(" ", "pid:", res.region.pid)
+                print(" ", "data:", res.data)
+                print(" ", "found at:", res.address)
                 print()
+
+    elif args.monitor:
+        pass
 
     else:
         all_regions = [region for process in processes for region in process.regions]
         for reg in all_regions:
-            pprint(vars(reg))
+            print("region:", reg.name)
+            print(" ", "address:", hex(reg.start), "--", hex(reg.end))
+            print(" ", "size:", reg.size)
+            print(" ", "perm:", reg.perm)
+            print(" ", "size:", reg.pid)
+            if args.checksum:
+                print(" ", "checksum:", reg.checksum())
+            print()
