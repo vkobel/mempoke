@@ -1,22 +1,37 @@
 #!/usr/bin/env python3
 
 from collections import namedtuple
-from typing import NamedTuple
 from pprint import pprint
+from hashlib import md5
+import sys
 import argparse
 import itertools
-import sys
 
-SeekResult = namedtuple('SeekResult', ['data', 'address', 'region', 'perm', 'pid'])
+SeekResult = namedtuple('SeekResult', ['term', 'data', 'address', 'region'])
 
 
-class MemoryRegion(NamedTuple):
+def digest(data):
+    h = md5()
+    h.update(data)
+    return h.hexdigest()
+
+
+class MemoryRegion:
     name: str
     start: int
     end: int
     perm: str
     size: int
     pid: int
+    checksum: str
+
+    def __init__(self, name, start, end, perm, size, pid):
+        self.name = name
+        self.start = start
+        self.end = end
+        self.perm = perm
+        self.size = size
+        self.pid = pid
 
     def read(self):
         with open(f"/proc/{self.pid}/mem", "r+b") as mem_file:
@@ -41,7 +56,7 @@ class MemoryRegion(NamedTuple):
 
 
 class ProcessMemory:
-    def __init__(self, pid, region_filter=None):
+    def __init__(self, pid, incl_filter=None, excl_filter=None, checksum=False):
         self.pid = pid
         self.regions = []
 
@@ -61,9 +76,15 @@ class ProcessMemory:
                         pid=self.pid
                     )
 
-                    # cumulative search of all filter items in a simple serialization of "info" dict
-                    lookup_str = ''.join(map(str, region._asdict().values()))
-                    if not region_filter or all(lookup_str.find(f_itm) >= 0 for f_itm in region_filter):
+                    lookup_str = ''.join(map(str, [region.name, region.start, region.perm, region.size, region.pid]))
+
+                    if (not incl_filter and not excl_filter) or \
+                       (not incl_filter or any(lookup_str.find(f_itm) >= 0 for f_itm in incl_filter)) and \
+                       (not excl_filter or all(lookup_str.find(f_itm) < 0 for f_itm in excl_filter)):
+
+                        if checksum:
+                            region.checksum = digest(region.read())
+
                         self.regions.append(region)
                         total_size += region.size
 
@@ -76,7 +97,8 @@ class ProcessMemory:
         try:
             with open(f"/proc/{self.pid}/mem", "r+b") as mem_file:
                 mem_file.seek(address)
-                mem_file.write(bytes(data.replace("\\x00", "\x00"), "ASCII"))
+                # mem_file.write(bytes(data.replace("\\x00", "\x00"), "ASCII"))
+                mem_file.write(to_bytes(data))
                 mem_file.flush()
         except OSError:
             pass
@@ -94,12 +116,13 @@ class ProcessMemory:
                         self.__write(dec_addr, write)
 
                     read_data = region.read_at_address(dec_addr - region.start, nb_bytes=read)
-                    yield SeekResult(read_data, seek, region.name, region.perm, self.pid)
+                    yield SeekResult(seek, read_data, seek, region)
                     break
             else:
+                mem = region.read()
                 while True:
-                    mem = region.read()
-                    offset = mem.find(seek.encode(), last_addr)
+                    term = to_bytes(seek)
+                    offset = mem.find(term, last_addr)
                     if offset < 0:
                         break
 
@@ -109,7 +132,23 @@ class ProcessMemory:
 
                     read_data = region.read_at_address(offset, nb_bytes=read)
                     last_addr = offset + 1
-                    yield SeekResult(read_data, hex(absolute_addr), region.name, region.perm, self.pid)
+                    yield SeekResult(term, read_data, hex(absolute_addr), region)
+
+
+def to_bytes(data):
+    if data.isdecimal():
+        integer = int(data)
+        # bytes repr as of : https://docs.python.org/3/library/stdtypes.html#int.to_bytes
+        return integer.to_bytes((integer.bit_length() + 7) // 8, byteorder=sys.byteorder)
+    else:
+        return data.encode()
+
+
+def from_bytes(data):
+    if not data.isascii():
+        return int.from_bytes(data, byteorder=sys.byteorder)
+    else:
+        return data
 
 
 if __name__ == "__main__":
@@ -117,17 +156,21 @@ if __name__ == "__main__":
 
     # Global options
     parser.add_argument('pids', nargs='+', type=int, help='The pid to operate on')
-    parser.add_argument('-f', '--filter', nargs='+', help='Filter on memory by region name or address')
+    parser.add_argument('-i', '--include', nargs='+', help='Filter on memory region name or address to include')
+    parser.add_argument('-e', '--exclude', nargs='+', help='Filter on memory region name or address to exclude')
     parser.add_argument('-d', '--dump', default=False, action="store_true", help='Dump memory into stdout')
+    parser.add_argument('-c', '--checksum', default=False, action="store_true", help='Provide md5 checksum for memory region')
 
     # Seek options
     parser.add_argument('-s', '--seek', help='Pattern to seek in memory, or address if prefixed with "0x"')
     parser.add_argument('-w', '--write', nargs='?', help='String to write at position found by the "--seek" argument')
     parser.add_argument('-b', '--read-bytes', nargs='?', type=int, help='Number of bytes to read when seeking a pattern')
 
+    parser.add_argument('-m', '--monitor', default=False, action="store_true", help='Enters monitoring mode')
+
     args = parser.parse_args()
 
-    processes = map(lambda pid: ProcessMemory(pid, args.filter), args.pids)
+    processes = map(lambda pid: ProcessMemory(pid, incl_filter=args.include, excl_filter=args.exclude, checksum=args.checksum), args.pids)
 
     if args.dump:
         all_regions = [region for process in processes for region in process.regions]
@@ -143,9 +186,14 @@ if __name__ == "__main__":
             print("pattern not found")
             quit(1)
         else:
-            pprint(results)
+            for res in results:
+                print("Term: ", res.term)
+                print("Data: ", res.data)
+                print("Address: ", res.address)
+                pprint(vars(res.region))
+                print()
 
     else:
         all_regions = [region for process in processes for region in process.regions]
         for reg in all_regions:
-            pprint(reg._asdict())
+            pprint(vars(reg))
