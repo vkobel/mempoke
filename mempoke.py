@@ -3,6 +3,7 @@ from collections import namedtuple
 from hashlib import md5
 import sys
 import argparse
+import time
 import itertools
 
 SeekResult = namedtuple('SeekResult', ['term', 'data', 'address', 'region'])
@@ -30,12 +31,12 @@ class MemoryRegion:
 
     def read_region(self, force_refresh=False):
         if not self.__mem_cache or force_refresh:
-            with open(f"/proc/{self.pid}/mem", "r+b") as mem_file:
-                mem_file.seek(self.start)
-                try:
+            try:
+                with open(f"/proc/{self.pid}/mem", "r+b") as mem_file:
+                    mem_file.seek(self.start)
                     self.__mem_cache = mem_file.read(self.size)
-                except OSError:
-                    self.__mem_cache = bytes()
+            except OSError:
+                self.__mem_cache = bytes()
 
         return self.__mem_cache
 
@@ -91,7 +92,8 @@ class ProcessMemory:
                 self.total_size_kib = total_size // 1024
 
         except FileNotFoundError:
-            raise Exception(f"PID '{self.pid}' not found!")
+            print(f"PID '{self.pid}' cannot be found")
+            quit(1)
 
     def __write(self, address, data):
         try:
@@ -103,7 +105,7 @@ class ProcessMemory:
         except OSError:
             pass
 
-    def seek_memory(self, seek, write=None, read=None):
+    def seek_memory(self, seek, write=None, read=None, force_refresh=False):
         for region in self.regions:
             last_addr = 0
 
@@ -112,12 +114,11 @@ class ProcessMemory:
                 dec_addr = int(seek, 16)
                 if region.start <= dec_addr and region.end > dec_addr:
 
-                    refresh_cache = False
                     if write:
                         self.__write(dec_addr, write)
-                        refresh_cache = True
+                        force_refresh = True
 
-                    read_data = region.read_at_address(dec_addr - region.start, nb_bytes=read, force_refresh=refresh_cache)
+                    read_data = region.read_at_address(dec_addr - region.start, nb_bytes=read, force_refresh=force_refresh)
                     yield SeekResult(seek, read_data, seek, region)
                     break
             else:
@@ -129,12 +130,11 @@ class ProcessMemory:
                         break
 
                     absolute_addr = region.start + offset
-                    refresh_cache = False
                     if write:
                         self.__write(absolute_addr, write)
-                        refresh_cache = True
+                        force_refresh = True
 
-                    read_data = region.read_at_address(offset, nb_bytes=read, force_refresh=refresh_cache)
+                    read_data = region.read_at_address(offset, nb_bytes=read, force_refresh=force_refresh)
                     last_addr = offset + 1
                     yield SeekResult(term, read_data, hex(absolute_addr), region)
 
@@ -173,16 +173,16 @@ if __name__ == "__main__":
 
     # Seek options
     parser.add_argument('-s', '--seek', help='Pattern to seek in memory, or address if prefixed with "0x"')
-    parser.add_argument('-w', '--write', nargs='?', help='String to write at position found by the "--seek" argument')
+    parser.add_argument('-w', '--write', nargs='?', help='Data to write at position found by the "--seek" argument')
     parser.add_argument('-b', '--read-bytes', nargs='?', type=int, help='Number of bytes to read when seeking a pattern')
 
-    parser.add_argument('-m', '--monitor', default=False, action="store_true", help='Enters monitoring mode')
+    parser.add_argument('-m', '--monitor', default=False, action="store_true", help='Enters monitoring mode, you must supply a seek pattern')
+    parser.add_argument('-f', '--freq', nargs='?', type=int, default=50, help='Frequency of monitoring mode, in milliseconds, defaults to 50ms')
 
     args = parser.parse_args()
 
-    processes = map(lambda pid: ProcessMemory(pid, incl_filter=args.include, excl_filter=args.exclude), args.pids)
-
     if args.dump:
+        processes = map(lambda pid: ProcessMemory(pid, incl_filter=args.include, excl_filter=args.exclude), args.pids)
         all_regions = [region for process in processes for region in process.regions]
         for region in all_regions:
             sys.stdout.buffer.write(region.read_region())
@@ -191,19 +191,39 @@ if __name__ == "__main__":
             sys.stderr.buffer.write(b"\n\nWarning multiple memory regions have been dump")
 
     elif args.seek:
-        results = itertools.chain.from_iterable(map(lambda p: (p.seek_memory(args.seek, write=args.write, read=args.read_bytes)), processes))
-        for res in results:
-            print("term:", res.term)
-            print(" ", "data:", res.data)
-            print(" ", "found at:", res.address)
-            print(" ", "pid:", res.region.pid)
-            print(" ", "region:", res.region.name)
-            print()
+        if args.monitor:
+            mon_dict = {}
+            i = 0
+            while True:
+                try:
+                    processes = map(lambda pid: ProcessMemory(pid, incl_filter=args.include, excl_filter=args.exclude), args.pids)
+                    results = itertools.chain.from_iterable(map(lambda p: p.seek_memory(args.seek, write=args.write, read=args.read_bytes), processes))
+                    for res in results:
+                        if res.address not in mon_dict.keys() or mon_dict[res.address] != res.data:
+                            mon_dict[res.address] = res.data
+                            print(f"{i}:", f"[{res.region.pid}]", res.data, "@", res.address, "in", res.region.name)
 
-    elif args.monitor:
-        pass
+                    i += 1
+                    time.sleep(args.freq / 1000)
+                except KeyboardInterrupt:
+                    print()
+                    print(mon_dict)
+                    quit(0)
+
+        else:
+            processes = map(lambda pid: ProcessMemory(pid, incl_filter=args.include, excl_filter=args.exclude), args.pids)
+            results = itertools.chain.from_iterable(map(lambda p: p.seek_memory(args.seek, write=args.write, read=args.read_bytes), processes))
+            for res in results:
+                print("term:", res.term)
+                print(" ", "data:", res.data)
+                print(" ", "found at:", res.address)
+                print(" ", "pid:", res.region.pid)
+                print(" ", "region:", res.region.name)
+                print()
 
     else:
+        # General region information
+        processes = map(lambda pid: ProcessMemory(pid, incl_filter=args.include, excl_filter=args.exclude), args.pids)
         all_regions = [region for process in processes for region in process.regions]
         for reg in all_regions:
             print(f"[{reg.pid}] region:", reg.name)
