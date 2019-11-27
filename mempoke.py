@@ -17,7 +17,6 @@ class MemoryRegion:
     size: int
     pid: int
     __checksum: str
-    __mem_cache: bytes
 
     def __init__(self, name, start, end, perm, size, pid):
         self.name = name
@@ -27,36 +26,50 @@ class MemoryRegion:
         self.size = size
         self.pid = pid
         self.__checksum = None
-        self.__mem_cache = bytes()
 
-    def read_region(self, force_refresh=False):
-        if not self.__mem_cache or force_refresh:
+    def find(self, pattern):
+        with open(f"/proc/{self.pid}/mem", "r+b") as mm:
             try:
-                with open(f"/proc/{self.pid}/mem", "r+b") as mem_file:
-                    mem_file.seek(self.start)
-                    self.__mem_cache = mem_file.read(self.size)
+                mm.seek(self.start)
+                mm = mm.read(self.size)
+                last_pos = 0
+                while True:
+                    offset = mm.find(to_bytes(pattern), last_pos)
+                    if offset < 0:
+                        break
+                    last_pos = offset + 1
+                    yield self.start + offset
             except OSError:
-                self.__mem_cache = bytes()
+                pass
 
-        return self.__mem_cache
-
-    def checksum(self, force_refresh=False):
+    def checksum(self):
         if not self.__checksum:
-            self.__checksum = digest(self.read_region(force_refresh))
+            self.__checksum = digest(self.read_region())
         return self.__checksum
 
-    def read_at_address(self, rel_address, nb_bytes=None, force_refresh=False):
-        mem_data = self.read_region(force_refresh)
+    def read_at(self, address, nb_bytes=None):
+        if address < self.start or address >= self.end:
+            raise ValueError('address not part of memory region')
 
-        if nb_bytes and type(nb_bytes) == int:
-            # if read-bytes flag is used, read that amount of bytes
-            return mem_data[rel_address - nb_bytes:rel_address + nb_bytes]
-        else:
-            # read until next zero byte or at max 50
-            until_zero = mem_data.find(b'\x00', rel_address)
-            if until_zero - rel_address > 50:
-                until_zero = rel_address + 50
-            return mem_data[rel_address:until_zero]
+        with open(f"/proc/{self.pid}/mem", "rb") as mm:
+            if nb_bytes and type(nb_bytes) == int:
+                # if read-bytes flag is used, read that amount of bytes before and after
+                mm.seek(address - nb_bytes)
+                return mm.read(nb_bytes * 2)
+            else:
+                # read until next zero byte or at max 50
+                mm.seek(address)
+                try:
+                    mem = mm.read(50)
+                    until_zero = mem.find(b'\x00')
+                    return mem[:until_zero] if until_zero >= 0 else mem
+                except OSError:
+                    return None
+
+    def write_at(self, address, write_bytes):
+        with open(f"/proc/{self.pid}/mem", "r+b") as mm:
+            mm.write(to_bytes(write_bytes))
+            mm.flush()
 
 
 class ProcessMemory:
@@ -95,19 +108,8 @@ class ProcessMemory:
             print(f"PID '{self.pid}' cannot be found")
             quit(1)
 
-    def __write(self, address, data):
-        try:
-            with open(f"/proc/{self.pid}/mem", "r+b") as mem_file:
-                mem_file.seek(address)
-                # mem_file.write(bytes(data.replace("\\x00", "\x00"), "ASCII"))
-                mem_file.write(to_bytes(data))
-                mem_file.flush()
-        except OSError:
-            pass
-
-    def seek_memory(self, seek, write=None, read=None, force_refresh=False):
+    def find_bytes(self, seek, write=None, read=None):
         for region in self.regions:
-            last_addr = 0
 
             # if seeking an address (starting with '0x'), just go directly there without looping
             if seek[:2] == '0x':
@@ -115,28 +117,15 @@ class ProcessMemory:
                 if region.start <= dec_addr and region.end > dec_addr:
 
                     if write:
-                        self.__write(dec_addr, write)
-                        force_refresh = True
+                        region.write_at(dec_addr, write)
 
-                    read_data = region.read_at_address(dec_addr - region.start, nb_bytes=read, force_refresh=force_refresh)
+                    read_data = region.read_at(dec_addr, nb_bytes=read)
                     yield SeekResult(seek, read_data, seek, region)
                     break
             else:
-                mem = region.read_region()
-                while True:
-                    term = to_bytes(seek)
-                    offset = mem.find(term, last_addr)
-                    if offset < 0:
-                        break
-
-                    absolute_addr = region.start + offset
-                    if write:
-                        self.__write(absolute_addr, write)
-                        force_refresh = True
-
-                    read_data = region.read_at_address(offset, nb_bytes=read, force_refresh=force_refresh)
-                    last_addr = offset + 1
-                    yield SeekResult(term, read_data, hex(absolute_addr), region)
+                for addr in region.find(seek):
+                    read_data = region.read_at(addr, read)
+                    yield SeekResult(seek, read_data, hex(addr), region)
 
 
 def to_bytes(data):
@@ -195,9 +184,15 @@ if __name__ == "__main__":
             mon_dict = {}
             i = 0
             while True:
+
+                # Find way to make monitor more efficient
+                # Here we re instantiate all matching process everytime -> not efficient?
+                # Make use of force refresh cache flag if necessary
+                # For example, re read only if memory region has changed (check checksum)
+
                 try:
                     processes = map(lambda pid: ProcessMemory(pid, incl_filter=args.include, excl_filter=args.exclude), args.pids)
-                    results = itertools.chain.from_iterable(map(lambda p: p.seek_memory(args.seek, write=args.write, read=args.read_bytes), processes))
+                    results = itertools.chain.from_iterable(map(lambda p: p.find_bytes(args.seek, write=args.write, read=args.read_bytes), processes))
                     for res in results:
                         if res.address not in mon_dict.keys() or mon_dict[res.address] != res.data:
                             mon_dict[res.address] = res.data
@@ -212,7 +207,7 @@ if __name__ == "__main__":
 
         else:
             processes = map(lambda pid: ProcessMemory(pid, incl_filter=args.include, excl_filter=args.exclude), args.pids)
-            results = itertools.chain.from_iterable(map(lambda p: p.seek_memory(args.seek, write=args.write, read=args.read_bytes), processes))
+            results = itertools.chain.from_iterable(map(lambda p: p.find_bytes(args.seek, write=args.write, read=args.read_bytes), processes))
             for res in results:
                 print("term:", res.term)
                 print(" ", "data:", res.data)
