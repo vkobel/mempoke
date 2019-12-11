@@ -85,7 +85,7 @@ class ProcessMemory:
                     addrs = list(map(lambda x: int(x, 16), region_info[0].split("-")))
 
                     region = MemoryRegion(
-                        name=region_info[5] if len(region_info) > 5 else hex(addrs[0]),
+                        name=region_info[5] if len(region_info) > 5 else "ANONYMOUS",
                         start=addrs[0],
                         end=addrs[1],
                         perm=region_info[1],
@@ -222,7 +222,7 @@ if __name__ == "__main__":
         all_regions = [region for process in processes for region in process.regions]
         for reg in all_regions:
             print(f"[{reg.pid}] region:", reg.name)
-            print(" ", "address:", hex(reg.start), "--", hex(reg.end))
+            print(" ", "address:", hex(reg.start), "-", hex(reg.end))
             print(" ", "size:", reg.size)
             print(" ", "perm:", reg.perm)
             if args.checksum:
