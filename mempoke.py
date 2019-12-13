@@ -6,7 +6,10 @@ import argparse
 import time
 import itertools
 
+from process_vm import ProcessVmWritev
+
 SeekResult = namedtuple('SeekResult', ['term', 'data', 'address', 'region'])
+pvmw = ProcessVmWritev()
 
 
 class MemoryRegion:
@@ -28,7 +31,7 @@ class MemoryRegion:
         self.__checksum = None
 
     def find(self, pattern):
-        with open(f"/proc/{self.pid}/mem", "r+b") as mm:
+        with open(f"/proc/{self.pid}/mem", "rb") as mm:
             try:
                 mm.seek(self.start)
                 mm = mm.read(self.size)
@@ -39,8 +42,9 @@ class MemoryRegion:
                         break
                     last_pos = offset + 1
                     yield self.start + offset
-            except OSError:
-                pass
+
+            except (OSError, ValueError):
+                print(f"Ignoring {self.name}...")
 
     def checksum(self):
         if not self.__checksum:
@@ -67,9 +71,7 @@ class MemoryRegion:
                     return None
 
     def write_at(self, address, write_bytes):
-        with open(f"/proc/{self.pid}/mem", "r+b") as mm:
-            mm.write(to_bytes(write_bytes))
-            mm.flush()
+        pvmw.write_vm(self.pid, address, to_bytes(write_bytes))
 
 
 class ProcessMemory:
@@ -115,15 +117,15 @@ class ProcessMemory:
             if seek[:2] == '0x':
                 dec_addr = int(seek, 16)
                 if region.start <= dec_addr and region.end > dec_addr:
-
                     if write:
                         region.write_at(dec_addr, write)
-
                     read_data = region.read_at(dec_addr, nb_bytes=read)
                     yield SeekResult(seek, read_data, seek, region)
                     break
             else:
                 for addr in region.find(seek):
+                    if write:
+                        region.write_at(addr, write)
                     read_data = region.read_at(addr, read)
                     yield SeekResult(seek, read_data, hex(addr), region)
 
@@ -165,8 +167,8 @@ if __name__ == "__main__":
     parser.add_argument('-w', '--write', nargs='?', help='Data to write at position found by the "--seek" argument')
     parser.add_argument('-b', '--read-bytes', nargs='?', type=int, help='Number of bytes to read when seeking a pattern')
 
-    parser.add_argument('-m', '--monitor', default=False, action="store_true", help='Enters monitoring mode, you must supply a seek pattern')
-    parser.add_argument('-f', '--freq', nargs='?', type=int, default=50, help='Frequency of monitoring mode, in milliseconds, defaults to 50ms')
+    parser.add_argument('-a', '--active', choices=['freq', 'syscall'], help='Enters "active" mode, you must supply a seek pattern. Write is also supported.')
+    parser.add_argument('-f', '--freq', nargs='?', type=int, default=50, help='Frequency of active "freq" mode, in milliseconds, defaults to 50ms')
 
     args = parser.parse_args()
 
@@ -180,7 +182,7 @@ if __name__ == "__main__":
             sys.stderr.buffer.write(b"\n\nWarning multiple memory regions have been dump")
 
     elif args.seek:
-        if args.monitor:
+        if args.active == 'freq':
             mon_dict = {}
             i = 0
             while True:
