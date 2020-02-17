@@ -51,24 +51,17 @@ class MemoryRegion:
             self.__checksum = digest(self.read_region())
         return self.__checksum
 
-    def read_at(self, address, nb_bytes=None):
+    def read_at(self, address, bytes_before=0, bytes_after=0, parse_bytes=False):
         if address < self.start or address >= self.end:
             raise ValueError('address not part of memory region')
 
         with open(f"/proc/{self.pid}/mem", "rb") as mm:
-            if nb_bytes and type(nb_bytes) == int:
-                # if read-bytes flag is used, read that amount of bytes before and after
-                mm.seek(address - nb_bytes)
-                return mm.read(nb_bytes * 2)
-            else:
-                # read until next zero byte or at max 50
-                mm.seek(address)
-                try:
-                    mem = mm.read(50)
-                    until_zero = mem.find(b'\x00')
-                    return mem[:until_zero] if until_zero >= 0 else mem
-                except OSError:
-                    return None
+            # read until next zero byte or at max 50
+            mm.seek(address - bytes_before)
+            try:
+                return from_bytes(mm.read(bytes_after)) if parse_bytes else mm.read(bytes_after)
+            except OSError:
+                return None
 
     def write_at(self, address, write_bytes):
         pvmw.write_vm(self.pid, address, to_bytes(write_bytes))
@@ -110,23 +103,30 @@ class ProcessMemory:
             print(f"PID '{self.pid}' cannot be found")
             quit(1)
 
-    def find_bytes(self, seek, write=None, read=None):
+    def find_bytes(self, seek, write=None, bytes_before=0, bytes_after=0, parse_bytes=False):
         for region in self.regions:
 
             # if seeking an address (starting with '0x'), just go directly there without looping
             if seek[:2] == '0x':
-                dec_addr = int(seek, 16)
-                if region.start <= dec_addr and region.end > dec_addr:
+                addr = int(seek, 16)
+                if region.start <= addr and region.end > addr:
                     if write:
-                        region.write_at(dec_addr, write)
-                    read_data = region.read_at(dec_addr, nb_bytes=read)
+                        region.write_at(addr, write)
+                        bytes_after = len(write) if bytes_after == 0 else bytes_after
+
+                    bytes_after = len(to_bytes(seek)) if bytes_after == 0 else bytes_after
+                    read_data = region.read_at(addr, bytes_before, bytes_after, parse_bytes)
+
                     yield SeekResult(seek, read_data, seek, region)
                     break
             else:
                 for addr in region.find(seek):
                     if write:
                         region.write_at(addr, write)
-                    read_data = region.read_at(addr, read)
+                        bytes_after = len(write) if bytes_after == 0 else bytes_after
+
+                    bytes_after = len(to_bytes(seek)) if bytes_after == 0 else bytes_after
+                    read_data = region.read_at(addr, bytes_before, bytes_after, parse_bytes)
                     yield SeekResult(seek, read_data, hex(addr), region)
 
 
@@ -165,9 +165,11 @@ if __name__ == "__main__":
     # Seek options
     parser.add_argument('-s', '--seek', help='Pattern to seek in memory, or address if prefixed with "0x"')
     parser.add_argument('-w', '--write', nargs='?', help='Data to write at position found by the "--seek" argument')
-    parser.add_argument('-b', '--read-bytes', nargs='?', type=int, help='Number of bytes to read when seeking a pattern')
+    parser.add_argument('-b', '--bytes-before', default=0, type=int, help='Number of bytes to read before the given pattern')
+    parser.add_argument('-a', '--bytes-after', default=0, type=int, help='Number of bytes to read after the given pattern')
+    parser.add_argument('--parse-bytes', default=False, action='store_true', help='Number of bytes to read after the given pattern')
 
-    parser.add_argument('-a', '--active', choices=['freq', 'syscall'], help='Enters "active" mode, you must supply a seek pattern. Write is also supported.')
+    parser.add_argument('-m', '--mode', choices=['single', 'freq', 'syscall'], default='single', help='Execution mode')
     parser.add_argument('-f', '--freq', nargs='?', type=int, default=50, help='Frequency of active "freq" mode, in milliseconds, defaults to 50ms')
 
     args = parser.parse_args()
@@ -182,19 +184,13 @@ if __name__ == "__main__":
             sys.stderr.buffer.write(b"\n\nWarning multiple memory regions have been dump")
 
     elif args.seek:
-        if args.active == 'freq':
+        if args.mode == 'freq':
             mon_dict = {}
             i = 0
             while True:
-
-                # Find way to make monitor more efficient
-                # Here we re instantiate all matching process everytime -> not efficient?
-                # Make use of force refresh cache flag if necessary
-                # For example, re read only if memory region has changed (check checksum)
-
                 try:
                     processes = map(lambda pid: ProcessMemory(pid, incl_filter=args.include, excl_filter=args.exclude), args.pids)
-                    results = itertools.chain.from_iterable(map(lambda p: p.find_bytes(args.seek, write=args.write, read=args.read_bytes), processes))
+                    results = itertools.chain.from_iterable(map(lambda p: p.find_bytes(args.seek, write=args.write, bytes_before=args.bytes_before, bytes_after=args.bytes_after, parse_bytes=args.parse_bytes), processes))
                     for res in results:
                         if res.address not in mon_dict.keys() or mon_dict[res.address] != res.data:
                             mon_dict[res.address] = res.data
@@ -209,7 +205,7 @@ if __name__ == "__main__":
 
         else:
             processes = map(lambda pid: ProcessMemory(pid, incl_filter=args.include, excl_filter=args.exclude), args.pids)
-            results = itertools.chain.from_iterable(map(lambda p: p.find_bytes(args.seek, write=args.write, read=args.read_bytes), processes))
+            results = itertools.chain.from_iterable(map(lambda p: p.find_bytes(args.seek, write=args.write, bytes_before=args.bytes_before, bytes_after=args.bytes_after, parse_bytes=args.parse_bytes), processes))
             for res in results:
                 print("term:", res.term)
                 print(" ", "data:", res.data)
