@@ -44,7 +44,7 @@ class MemoryRegion:
                     yield self.start + offset
 
             except (OSError, ValueError):
-                print(f"Ignoring {self.name}...")
+                print(f"Ignoring {self.name}...", file=sys.stderr)
 
     def checksum(self):
         if not self.__checksum:
@@ -167,7 +167,7 @@ if __name__ == "__main__":
     parser.add_argument('-w', '--write', nargs='?', help='Data to write at position found by the "--seek" argument')
     parser.add_argument('-b', '--bytes-before', default=0, type=int, help='Number of bytes to read before the given pattern')
     parser.add_argument('-a', '--bytes-after', default=0, type=int, help='Number of bytes to read after the given pattern')
-    parser.add_argument('--parse-bytes', default=False, action='store_true', help='Number of bytes to read after the given pattern')
+    parser.add_argument('--parse-bytes', default=False, action='store_true', help='Attempt to decode non-ascii integers from byte strings')
 
     parser.add_argument('-m', '--mode', choices=['single', 'freq', 'syscall'], default='single', help='Execution mode')
     parser.add_argument('-f', '--freq', nargs='?', type=int, default=50, help='Frequency of active "freq" mode, in milliseconds, defaults to 50ms')
